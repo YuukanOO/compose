@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/compose-spec/compose-go/v2/types"
@@ -65,9 +66,10 @@ func (s *composeService) Up(ctx context.Context, project *types.Project, options
 	// we might miss a signal while setting up the second channel read
 	// (this is also why signal.Notify is used vs signal.NotifyContext)
 	signalChan := make(chan os.Signal, 2)
-	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
 	defer close(signalChan)
-	var isTerminated bool
+	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(signalChan)
+	var isTerminated atomic.Bool
 	printer := newLogPrinter(options.Start.Attach)
 
 	doneCh := make(chan bool)
@@ -75,15 +77,13 @@ func (s *composeService) Up(ctx context.Context, project *types.Project, options
 		first := true
 		gracefulTeardown := func() {
 			printer.Cancel()
-			formatter.ClearLine()
 			fmt.Fprintln(s.stdinfo(), "Gracefully stopping... (press Ctrl+C again to force)")
 			eg.Go(func() error {
-				err := s.Stop(context.Background(), project.Name, api.StopOptions{
+				err := s.Stop(context.WithoutCancel(ctx), project.Name, api.StopOptions{
 					Services: options.Create.Services,
 					Project:  project,
 				})
-				isTerminated = true
-				close(doneCh)
+				isTerminated.Store(true)
 				return err
 			})
 			first = false
@@ -95,13 +95,15 @@ func (s *composeService) Up(ctx context.Context, project *types.Project, options
 			if err != nil {
 				logrus.Warn("could not start menu, an error occurred while starting.")
 			} else {
+				defer keyboard.Close() //nolint:errcheck
 				isWatchConfigured := s.shouldWatch(project)
 				isDockerDesktopActive := s.isDesktopIntegrationActive()
-				tracing.KeyboardMetrics(ctx, options.Start.NavigationMenu, isDockerDesktopActive, isWatchConfigured)
+				isDockerDesktopComposeUI := s.isDesktopUIEnabled()
+				tracing.KeyboardMetrics(ctx, options.Start.NavigationMenu, isDockerDesktopActive, isWatchConfigured, isDockerDesktopComposeUI)
 
-				formatter.NewKeyboardManager(ctx, isDockerDesktopActive, isWatchConfigured, signalChan, s.Watch)
+				formatter.NewKeyboardManager(ctx, isDockerDesktopActive, isWatchConfigured, isDockerDesktopComposeUI, signalChan, s.watch)
 				if options.Start.Watch {
-					formatter.KeyboardManager.StartWatch(ctx, project, options)
+					formatter.KeyboardManager.StartWatch(ctx, doneCh, project, options)
 				}
 			}
 		}
@@ -120,7 +122,7 @@ func (s *composeService) Up(ctx context.Context, project *types.Project, options
 					break
 				}
 				eg.Go(func() error {
-					err := s.kill(context.Background(), project.Name, api.KillOptions{
+					err := s.kill(context.WithoutCancel(ctx), project.Name, api.KillOptions{
 						Services: options.Create.Services,
 						Project:  project,
 						All:      true,
@@ -134,7 +136,7 @@ func (s *composeService) Up(ctx context.Context, project *types.Project, options
 				})
 				return nil
 			case event := <-kEvents:
-				formatter.KeyboardManager.HandleKeyEvents(event, ctx, project, options)
+				formatter.KeyboardManager.HandleKeyEvents(event, ctx, doneCh, project, options)
 			}
 		}
 	})
@@ -158,25 +160,24 @@ func (s *composeService) Up(ctx context.Context, project *types.Project, options
 		eg.Go(func() error {
 			buildOpts := *options.Create.Build
 			buildOpts.Quiet = true
-			return s.Watch(ctx, project, options.Start.Services, api.WatchOptions{
+			return s.watch(ctx, doneCh, project, options.Start.Services, api.WatchOptions{
 				Build: &buildOpts,
 				LogTo: options.Start.Attach,
 			})
 		})
 	}
 
-	// We don't use parent (cancelable) context as we manage sigterm to stop the stack
-	err = s.start(context.Background(), project.Name, options.Start, printer.HandleEvent)
-	if err != nil && !isTerminated { // Ignore error if the process is terminated
+	// We use the parent context without cancellation as we manage sigterm to stop the stack
+	err = s.start(context.WithoutCancel(ctx), project.Name, options.Start, printer.HandleEvent)
+	if err != nil && !isTerminated.Load() { // Ignore error if the process is terminated
 		return err
 	}
 
+	// Signal for the signal-handler goroutines to stop
+	close(doneCh)
+
 	printer.Stop()
 
-	if !isTerminated {
-		// signal for the signal-handler goroutines to stop
-		close(doneCh)
-	}
 	err = eg.Wait().ErrorOrNil()
 	if exitCode != 0 {
 		errMsg := ""

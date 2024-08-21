@@ -71,8 +71,8 @@ func (s *State) NavBar() bool {
 	return s.determineFeatureState("ComposeNav")
 }
 
-func (s *State) AutoFileShares() bool {
-	return s.determineFeatureState("ComposeAutoFileShares")
+func (s *State) ComposeUI() bool {
+	return s.determineFeatureState("ComposeUIView")
 }
 
 func (s *State) determineFeatureState(name string) bool {

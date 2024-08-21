@@ -33,6 +33,9 @@ import (
 	"github.com/compose-spec/compose-go/v2/types"
 	"github.com/docker/compose/v2/internal/desktop"
 	pathutil "github.com/docker/compose/v2/internal/paths"
+	"github.com/docker/compose/v2/pkg/api"
+	"github.com/docker/compose/v2/pkg/progress"
+	"github.com/docker/compose/v2/pkg/utils"
 	moby "github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/blkiodev"
 	"github.com/docker/docker/api/types/container"
@@ -41,15 +44,10 @@ import (
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/strslice"
 	"github.com/docker/docker/api/types/versions"
-	volume_api "github.com/docker/docker/api/types/volume"
+	volumetypes "github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/errdefs"
 	"github.com/docker/go-connections/nat"
-	"github.com/docker/go-units"
 	"github.com/sirupsen/logrus"
-
-	"github.com/docker/compose/v2/pkg/api"
-	"github.com/docker/compose/v2/pkg/progress"
-	"github.com/docker/compose/v2/pkg/utils"
 )
 
 type createOptions struct {
@@ -77,8 +75,13 @@ func (s *composeService) create(ctx context.Context, project *types.Project, opt
 		options.Services = project.ServiceNames()
 	}
 
+	err := project.CheckContainerNameUnicity()
+	if err != nil {
+		return err
+	}
+
 	var observedState Containers
-	observedState, err := s.getContainers(ctx, project.Name, oneOffInclude, true)
+	observedState, err = s.getContainers(ctx, project.Name, oneOffInclude, true)
 	if err != nil {
 		return err
 	}
@@ -98,8 +101,7 @@ func (s *composeService) create(ctx context.Context, project *types.Project, opt
 		return err
 	}
 
-	allServiceNames := append(project.ServiceNames(), project.DisabledServiceNames()...)
-	orphans := observedState.filter(isNotService(allServiceNames...))
+	orphans := observedState.filter(isOrphaned(project))
 	if len(orphans) > 0 && !options.IgnoreOrphans {
 		if options.RemoveOrphans {
 			err := s.removeContainers(ctx, orphans, nil, false)
@@ -117,21 +119,21 @@ func (s *composeService) create(ctx context.Context, project *types.Project, opt
 }
 
 func prepareNetworks(project *types.Project) {
-	for k, network := range project.Networks {
-		network.Labels = network.Labels.Add(api.NetworkLabel, k)
-		network.Labels = network.Labels.Add(api.ProjectLabel, project.Name)
-		network.Labels = network.Labels.Add(api.VersionLabel, api.ComposeVersion)
-		project.Networks[k] = network
+	for k, nw := range project.Networks {
+		nw.Labels = nw.Labels.Add(api.NetworkLabel, k)
+		nw.Labels = nw.Labels.Add(api.ProjectLabel, project.Name)
+		nw.Labels = nw.Labels.Add(api.VersionLabel, api.ComposeVersion)
+		project.Networks[k] = nw
 	}
 }
 
 func (s *composeService) ensureNetworks(ctx context.Context, networks types.Networks) error {
-	for i, network := range networks {
-		err := s.ensureNetwork(ctx, &network)
+	for i, nw := range networks {
+		err := s.ensureNetwork(ctx, &nw)
 		if err != nil {
 			return err
 		}
-		networks[i] = network
+		networks[i] = nw
 	}
 	return nil
 }
@@ -162,14 +164,25 @@ func (s *composeService) ensureProjectVolumes(ctx context.Context, project *type
 					if !filepath.IsAbs(p) {
 						return fmt.Errorf("file share path is not absolute: %s", p)
 					}
-					if _, err := os.Stat(p); errors.Is(err, fs.ErrNotExist) {
+					if fi, err := os.Stat(p); errors.Is(err, fs.ErrNotExist) {
+						// actual directory will be implicitly created when the
+						// file share is initialized if it doesn't exist, so
+						// need to filter out any that should not be auto-created
 						if vol.Bind != nil && !vol.Bind.CreateHostPath {
-							return fmt.Errorf("service %s: host path %q does not exist and `create_host_path` is false", svcName, vol.Source)
+							logrus.Debugf("Skipping creating file share for %q: does not exist and `create_host_path` is false", p)
+							continue
 						}
-						if err := os.MkdirAll(p, 0o755); err != nil {
-							return fmt.Errorf("creating host path: %w", err)
-						}
+					} else if err != nil {
+						// if we can't read the path, we won't be able ot make
+						// a file share for it
+						logrus.Debugf("Skipping creating file share for %q: %v", p, err)
+						continue
+					} else if !fi.IsDir() {
+						// ignore files & special types (e.g. Unix sockets)
+						logrus.Debugf("Skipping creating file share for %q: not a directory", p)
+						continue
 					}
+
 					paths = append(paths, p)
 				}
 			}
@@ -180,14 +193,14 @@ func (s *composeService) ensureProjectVolumes(ctx context.Context, project *type
 
 			fileShareManager := desktop.NewFileShareManager(s.desktopCli, project.Name, paths)
 			if err := fileShareManager.EnsureExists(ctx); err != nil {
-				return fmt.Errorf("initializing: %w", err)
+				return fmt.Errorf("initializing file shares: %w", err)
 			}
 		}
 		return nil
 	}()
 
 	if err != nil {
-		progress.ContextWriter(ctx).TailMsgf("Failed to prepare Synchronized File Shares: %v", err)
+		progress.ContextWriter(ctx).TailMsgf("Failed to prepare Synchronized file shares: %v", err)
 	}
 	return nil
 }
@@ -429,6 +442,7 @@ func createEndpointSettings(p *types.Project, service types.ServiceConfig, servi
 		ipv4Address string
 		ipv6Address string
 		macAddress  string
+		driverOpts  types.Options
 	)
 	if config != nil {
 		ipv4Address = config.Ipv4Address
@@ -439,6 +453,7 @@ func createEndpointSettings(p *types.Project, service types.ServiceConfig, servi
 			LinkLocalIPs: config.LinkLocalIPs,
 		}
 		macAddress = config.MacAddress
+		driverOpts = config.DriverOpts
 	}
 	return &network.EndpointSettings{
 		Aliases:     getAliases(p, service, serviceIndex, networkKey, useNetworkAliases),
@@ -447,6 +462,7 @@ func createEndpointSettings(p *types.Project, service types.ServiceConfig, servi
 		IPv6Gateway: ipv6Address,
 		IPAMConfig:  ipam,
 		MacAddress:  macAddress,
+		DriverOpts:  driverOpts,
 	}
 }
 
@@ -666,8 +682,8 @@ func getDeployResources(s types.ServiceConfig) container.Resources {
 	return resources
 }
 
-func toUlimits(m map[string]*types.UlimitsConfig) []*units.Ulimit {
-	var ulimits []*units.Ulimit
+func toUlimits(m map[string]*types.UlimitsConfig) []*container.Ulimit {
+	var ulimits []*container.Ulimit
 	for name, u := range m {
 		soft := u.Single
 		if u.Soft != 0 {
@@ -677,7 +693,7 @@ func toUlimits(m map[string]*types.UlimitsConfig) []*units.Ulimit {
 		if u.Hard != 0 {
 			hard = u.Hard
 		}
-		ulimits = append(ulimits, &units.Ulimit{
+		ulimits = append(ulimits, &container.Ulimit{
 			Name: name,
 			Hard: int64(hard),
 			Soft: int64(soft),
@@ -1174,7 +1190,7 @@ func (s *composeService) resolveOrCreateNetwork(ctx context.Context, n *types.Ne
 	expectedProjectLabel := n.Labels[api.ProjectLabel]
 
 	// First, try to find a unique network matching by name or ID
-	inspect, err := s.apiClient().NetworkInspect(ctx, n.Name, moby.NetworkInspectOptions{})
+	inspect, err := s.apiClient().NetworkInspect(ctx, n.Name, network.InspectOptions{})
 	if err == nil {
 		// NetworkInspect will match on ID prefix, so double check we get the expected one
 		// as looking for network named `db` we could erroneously matched network ID `db9086999caf`
@@ -1196,7 +1212,7 @@ func (s *composeService) resolveOrCreateNetwork(ctx context.Context, n *types.Ne
 	// ignore other errors. Typically, an ambiguous request by name results in some generic `invalidParameter` error
 
 	// Either not found, or name is ambiguous - use NetworkList to list by name
-	networks, err := s.apiClient().NetworkList(ctx, moby.NetworkListOptions{
+	networks, err := s.apiClient().NetworkList(ctx, network.ListOptions{
 		Filters: filters.NewArgs(filters.Arg("name", n.Name)),
 	})
 	if err != nil {
@@ -1204,7 +1220,7 @@ func (s *composeService) resolveOrCreateNetwork(ctx context.Context, n *types.Ne
 	}
 
 	// NetworkList Matches all or part of a network name, so we have to filter for a strict match
-	networks = utils.Filter(networks, func(net moby.NetworkResource) bool {
+	networks = utils.Filter(networks, func(net network.Summary) bool {
 		return net.Name == n.Name
 	})
 
@@ -1240,15 +1256,14 @@ func (s *composeService) resolveOrCreateNetwork(ctx context.Context, n *types.Ne
 			Config: config,
 		}
 	}
-	createOpts := moby.NetworkCreate{
-		CheckDuplicate: true,
-		Labels:         n.Labels,
-		Driver:         n.Driver,
-		Options:        n.DriverOpts,
-		Internal:       n.Internal,
-		Attachable:     n.Attachable,
-		IPAM:           ipam,
-		EnableIPv6:     n.EnableIPv6,
+	createOpts := network.CreateOptions{
+		Labels:     n.Labels,
+		Driver:     n.Driver,
+		Options:    n.DriverOpts,
+		Internal:   n.Internal,
+		Attachable: n.Attachable,
+		IPAM:       ipam,
+		EnableIPv6: n.EnableIPv6,
 	}
 
 	if n.Ipam.Driver != "" || len(n.Ipam.Config) > 0 {
@@ -1286,7 +1301,7 @@ func (s *composeService) resolveExternalNetwork(ctx context.Context, n *types.Ne
 	// filter is used to look for an exact match to prevent e.g. a network
 	// named `db` from getting erroneously matched to a network with an ID
 	// like `db9086999caf`
-	networks, err := s.apiClient().NetworkList(ctx, moby.NetworkListOptions{
+	networks, err := s.apiClient().NetworkList(ctx, network.ListOptions{
 		Filters: filters.NewArgs(filters.Arg("name", n.Name)),
 	})
 
@@ -1296,16 +1311,15 @@ func (s *composeService) resolveExternalNetwork(ctx context.Context, n *types.Ne
 
 	if len(networks) == 0 {
 		// in this instance, n.Name is really an ID
-		sn, err := s.apiClient().NetworkInspect(ctx, n.Name, moby.NetworkInspectOptions{})
-		if err != nil {
+		sn, err := s.apiClient().NetworkInspect(ctx, n.Name, network.InspectOptions{})
+		if err != nil && !errdefs.IsNotFound(err) {
 			return err
 		}
 		networks = append(networks, sn)
-
 	}
 
 	// NetworkList API doesn't return the exact name match, so we can retrieve more than one network with a request
-	networks = utils.Filter(networks, func(net moby.NetworkResource) bool {
+	networks = utils.Filter(networks, func(net network.Inspect) bool {
 		// later in this function, the name is changed the to ID.
 		// this function is called during the rebuild stage of `compose watch`.
 		// we still require just one network back, but we need to run the search on the ID
@@ -1366,7 +1380,7 @@ func (s *composeService) createVolume(ctx context.Context, volume types.VolumeCo
 	eventName := fmt.Sprintf("Volume %q", volume.Name)
 	w := progress.ContextWriter(ctx)
 	w.Event(progress.CreatingEvent(eventName))
-	_, err := s.apiClient().VolumeCreate(ctx, volume_api.CreateOptions{
+	_, err := s.apiClient().VolumeCreate(ctx, volumetypes.CreateOptions{
 		Labels:     volume.Labels,
 		Name:       volume.Name,
 		Driver:     volume.Driver,
